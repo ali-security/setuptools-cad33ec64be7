@@ -2,6 +2,7 @@ from __future__ import absolute_import
 
 import sys
 import os
+import time
 import distutils.errors
 
 from setuptools.extern import six
@@ -11,6 +12,13 @@ import pkg_resources
 import setuptools.package_index
 from setuptools.tests.server import IndexServer
 from .textwrap import DALS
+
+
+TIME_LIMIT = 5
+"""
+Upper bound, in seconds, for matching a contrived attack string. The
+vulnerable expression takes far longer than this on the same input.
+"""
 
 
 class TestPackageIndex:
@@ -273,3 +281,50 @@ class TestPyPIConfig:
         cred = cfg.creds_by_repository['https://pypi.org']
         assert cred.username == 'jaraco'
         assert cred.password == 'pity%'
+
+
+def test_REL_DoS():
+    """
+    REL should not hang on a contrived attack string.
+    """
+    attack = '< rel=' + ' ' * 2**12
+    start = time.time()
+    setuptools.package_index.REL.search(attack)
+    assert time.time() - start < TIME_LIMIT
+
+
+def test_find_external_links_DoS():
+    """
+    find_external_links should not hang on a page carrying a contrived
+    attack string.
+    """
+    page = '<html><body><p>links</p>< rel=' + ' ' * 2**12
+    start = time.time()
+    links = list(setuptools.package_index.find_external_links(
+        'http://example.com/', page))
+    assert time.time() - start < TIME_LIMIT
+    assert links == []
+
+
+def test_find_external_links_rel():
+    """
+    rel="homepage" and rel="download" links are still discovered.
+    """
+    find = setuptools.package_index.find_external_links
+    base = 'http://example.com/pkg/'
+
+    page = '<a href="/foo" rel="homepage">Home</a>'
+    assert list(find(base, page)) == ['http://example.com/foo']
+
+    page = "<a rel = 'download' href='http://example.com/foo-1.0.tar.gz'>"
+    assert list(find(base, page)) == ['http://example.com/foo-1.0.tar.gz']
+
+    page = '<a HREF="foo-1.0.zip" REL=Download>'
+    assert list(find(base, page)) == ['http://example.com/pkg/foo-1.0.zip']
+
+    page = '<a rel="nofollow" href="/bar">Other</a>'
+    assert list(find(base, page)) == []
+
+    match = setuptools.package_index.REL.search(
+        '<a href="/foo" rel="homepage">')
+    assert match.group(2) == 'homepage'
