@@ -428,6 +428,151 @@ class TestPackageIndex:
         assert log_file.check(file=1)
         assert payload in log_file.read().splitlines()
 
+    # CVE-2025-47273: the name of a downloaded file comes from the last,
+    # percent-decoded, path segment of the URL.  Path separators, drive
+    # letters and parent-directory references in it must be neutralised so
+    # the download can never land outside the requested directory.
+    @pytest.mark.parametrize(
+        'name,expected',
+        [
+            (
+                '/home/user/.ssh/authorized_keys',
+                '_home_user_.ssh_authorized_keys',
+            ),
+            ('..\\foo\\bing', '__foo_bing'),
+            ('D:bar', 'D_bar'),
+            ('C:\\bar', 'C__bar'),
+            ('foo..bar', 'foo..bar'),
+            ('D:../foo', 'D___foo'),
+            ('..', '_'),
+            ('../../etc/passwd', '____etc_passwd'),
+            ('setuptools-39.2.0.tar.gz', 'setuptools-39.2.0.tar.gz'),
+        ],
+    )
+    def test_sanitize(self, name, expected):
+        sanitize = setuptools.package_index.PackageIndex._sanitize
+        assert sanitize(name) == expected
+
+    def test_resolve_download_filename(self, tmpdir):
+        index_cls = setuptools.package_index.PackageIndex
+        resolve = index_cls._resolve_download_filename
+        root = str(tmpdir)
+
+        url = (
+            'https://files.pythonhosted.org/packages/a9/5a/0db/'
+            'setuptools-39.2.0.tar.gz'
+        )
+        expected = os.path.join(root, 'setuptools-39.2.0.tar.gz')
+        assert resolve(url, root) == expected
+        # the extra .zip is stripped from eggs
+        url = 'https://example.com/foo-1.0-py2.7.egg.zip'
+        expected = os.path.join(root, 'foo-1.0-py2.7.egg')
+        assert resolve(url, root) == expected
+        # the fragment is not part of the name
+        url = 'https://example.com/foo-1.0.tar.gz#egg=foo-1.0'
+        assert resolve(url, root) == os.path.join(root, 'foo-1.0.tar.gz')
+        # dots that are not a parent directory reference are left alone
+        url = 'https://example.com/foo..bar-1.0.tar.gz'
+        expected = os.path.join(root, 'foo..bar-1.0.tar.gz')
+        assert resolve(url, root) == expected
+        # a URL with no path gets a default name
+        url = 'https://example.com/'
+        assert resolve(url, root) == os.path.join(root, '__downloaded__')
+
+    @pytest.mark.parametrize(
+        'url',
+        [
+            'https://anyhost/%2fhome%2fuser%2f.ssh%2fauthorized_keys',
+            'https://anyhost/%2e%2e%2f%2e%2e%2fetc%2fpasswd',
+            'https://anyhost/..%2f..%2f..%2fevil.egg',
+            'https://anyhost/..%5c..%5cevil.egg',
+            'https://anyhost/%5cevil.egg',
+            'https://anyhost/C:%5cevil.egg',
+            'https://anyhost/C%3a%5cevil.egg',
+            'https://anyhost/D:evil.egg',
+            'https://anyhost/D:..%5cevil.egg',
+            'https://anyhost/..',
+            'https://anyhost/%2e%2e',
+            'https://sourceforge.net/projects/x/files/'
+            '%2fhome%2fuser%2fevil.egg/download',
+        ],
+    )
+    def test_resolve_download_filename_stays_in_tmpdir(self, tmpdir, url):
+        index_cls = setuptools.package_index.PackageIndex
+        resolve = index_cls._resolve_download_filename
+        root = str(tmpdir)
+
+        filename = resolve(url, root)
+
+        assert os.path.dirname(filename) == root
+        assert os.path.dirname(os.path.abspath(filename)) == root
+        name = os.path.basename(filename)
+        assert name not in ('', os.curdir, os.pardir)
+        for directive in ('/', '\\', ':'):
+            assert directive not in name
+
+    @pytest.mark.parametrize(
+        'kind',
+        ['absolute', 'absolute-backslash', 'parent', 'parent-backslash'],
+    )
+    def test_download_stays_in_tmpdir(self, tmpdir, kind):
+        """
+        A URL whose decoded file name is a path must not make ``download``
+        write outside of the requested directory.
+        """
+        target = tmpdir.join('target')
+        target.ensure(dir=True)
+        outside = tmpdir.join('outside', 'pwned.txt')
+        outside.dirpath().ensure(dir=True)
+
+        if kind.startswith('absolute'):
+            path = str(outside)
+        else:
+            path = os.path.relpath(str(outside), str(target))
+        if kind.endswith('backslash'):
+            path = path.replace(os.sep, '\\')
+        url = 'https://anyhost/' + urllib.parse.quote(path, safe='')
+
+        written = []
+
+        def _download_to(url, filename):
+            written.append(filename)
+            with open(filename, 'wb') as stream:
+                stream.write(b'payload')
+            return {}
+
+        index = setuptools.package_index.PackageIndex()
+        with mock.patch.object(index, '_download_to', _download_to):
+            result = index.download(url, str(target))
+
+        assert written == [result]
+        assert os.path.dirname(result) == str(target)
+        assert os.path.isfile(result)
+        assert not outside.check()
+
+    @pytest.mark.parametrize('scheme', ['git+https', 'hg+https', 'svn+https'])
+    def test_download_vcs_stays_in_tmpdir(self, tmpdir, scheme):
+        """
+        The checkout directory of a VCS URL must also stay within the
+        requested directory.
+        """
+        target = tmpdir.join('target')
+        target.ensure(dir=True)
+        outside = tmpdir.join('outside', 'checkout')
+        url = '%s://vcs.example/%s#egg=foo' % (
+            scheme, urllib.parse.quote(str(outside), safe=''))
+        index = setuptools.package_index.PackageIndex()
+
+        with _no_shell() as calls:
+            result = index.download(url, str(target))
+
+        assert os.path.dirname(result) == str(target)
+        assert calls, "expected the VCS tool to be invoked"
+        # the checkout is made into the resolved directory, nowhere else
+        assert calls[0][-1] == result
+        for args in calls:
+            assert str(outside) not in args
+
     def test_local_index(self, tmpdir):
         """
         local_open should be able to read an index from the file system.

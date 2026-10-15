@@ -793,20 +793,67 @@ class PackageIndex(Environment):
                 raise DistutilsError("Download error for %s: %s"
                                      % (url, v))
 
-    def _download_url(self, url, tmpdir):
-        # Determine download filename
-        #
-        name, fragment = egg_info_for_url(url)
-        if name:
-            while '..' in name:
-                name = name.replace('..', '.').replace('\\', '_')
-        else:
-            name = "__downloaded__"  # default if URL has no path contents
+    @staticmethod
+    def _sanitize(name):
+        r"""
+        Replace unsafe path directives with underscores.
+
+        >>> san = PackageIndex._sanitize
+        >>> san('/home/user/.ssh/authorized_keys')
+        '_home_user_.ssh_authorized_keys'
+        >>> san('..\\foo\\bing')
+        '__foo_bing'
+        >>> san('D:bar')
+        'D_bar'
+        >>> san('C:\\bar')
+        'C__bar'
+        >>> san('foo..bar')
+        'foo..bar'
+        >>> san('D:../foo')
+        'D___foo'
+        """
+        pattern = '|'.join((
+            # drive letters
+            r':',
+            # path separators
+            r'[/\\]',
+            # parent dirs
+            r'(?:(?<=([/\\]|:))\.\.(?=[/\\]|$))|(?:^\.\.(?=[/\\]|$))',
+        ))
+        return re.sub(pattern, r'_', name)
+
+    @classmethod
+    def _resolve_download_filename(cls, url, tmpdir):
+        """
+        >>> du = PackageIndex._resolve_download_filename
+        >>> root = str(getfixture('tmpdir'))
+        >>> url = 'https://files.pythonhosted.org/packages/a9/5a/0db.../setuptools-39.2.0.tar.gz'
+        >>> os.path.relpath(du(url, root), root)
+        'setuptools-39.2.0.tar.gz'
+
+        Ensures the target is always in tmpdir.
+
+        >>> url = 'https://anyhost/%2fhome%2fuser%2f.ssh%2fauthorized_keys'
+        >>> os.path.relpath(du(url, root), root)
+        '_home_user_.ssh_authorized_keys'
+        """
+        name, _fragment = egg_info_for_url(url)
+        name = cls._sanitize(
+            name
+            or
+            # default if URL has no path contents
+            '__downloaded__'
+        )
 
         if name.endswith('.egg.zip'):
             name = name[:-4]  # strip the extra .zip before download
 
-        filename = os.path.join(tmpdir, name)
+        return os.path.join(tmpdir, name)
+
+    def _download_url(self, url, tmpdir):
+        # Determine download filename
+        #
+        filename = self._resolve_download_filename(url, tmpdir)
 
         return (
             self._download_vcs(url, filename) or
