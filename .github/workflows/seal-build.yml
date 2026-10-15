@@ -1,0 +1,25 @@
+name: seal-build
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container: python:3.6
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install wheel matching the published Generator
+        run: python -m pip install "wheel==0.31.1"
+      - name: Bootstrap egg_info
+        run: python bootstrap.py
+      - name: Build sdist and wheel (upstream release alias)
+        run: python setup.py release
+      - name: List dist
+        run: ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error

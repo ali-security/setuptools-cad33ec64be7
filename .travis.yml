@@ -1,14 +1,14 @@
-dist: trusty
+dist: xenial
 sudo: false
+env:
+  global:
+  - PIP_INDEX_URL=https://:2018-05-19@time-machines-pypi.sealsecurity.io/
 language: python
 python:
 - &latest_py2 2.7
 - 3.4
 - 3.5
 - &latest_py3 3.6
-- nightly
-- pypy
-- pypy3
 
 jobs:
   fast_finish: true
@@ -36,13 +36,16 @@ jobs:
       skip_cleanup: true
       skip_upload_docs: true
 
-cache: pip
+cache: false
 
 install:
 # ensure we have recent pip/setuptools
 - pip install --upgrade pip setuptools
-# need tox to get started
-- pip install tox tox-venv
+# need tox to get started; virtualenv 16.0.0 seeds the tox envs with the
+# release-era pip 10.0.1 / setuptools 39.1.0 (the 2.7/3.4/3.5 images ship
+# virtualenv 20 or venv seeds that break the setup_requires/editable installs)
+- pip install "virtualenv==16.0.0" tox
+- if [ "$TRAVIS_PYTHON_VERSION" = "3.6" ]; then pip install tox-venv; fi
 
 # Output the env, to verify behavior
 - env
@@ -61,20 +64,6 @@ script:
         ;;
       *)
         tox -- --cov
-        ;;
-      esac
-    )
-
-after_success:
-  - |
-    ( # Upload coverage data.
-      set -ex
-      case $TRAVIS_PYTHON_VERSION in
-      pypy*)
-        ;;
-        *)
-        export TRAVIS_JOB_NAME="${TRAVIS_PYTHON_VERSION} (LANG=$LANG)" CODECOV_ENV=TRAVIS_JOB_NAME
-        tox -e coverage,codecov
         ;;
       esac
     )
