@@ -3,7 +3,11 @@ from __future__ import absolute_import
 import sys
 import os
 import time
+import contextlib
 import distutils.errors
+
+import mock
+import pytest
 
 from setuptools.extern import six
 from setuptools.extern.six.moves import urllib, http_client
@@ -19,6 +23,31 @@ TIME_LIMIT = 5
 Upper bound, in seconds, for matching a contrived attack string. The
 vulnerable expression takes far longer than this on the same input.
 """
+
+
+@contextlib.contextmanager
+def _no_shell():
+    """
+    Capture the VCS invocations made in the block, asserting that none of
+    them is handed to a shell (CVE-2024-6345).
+
+    Yields the list of argument vectors passed to ``subprocess.check_call``.
+    """
+    calls = []
+
+    def check_call(args, **kwargs):
+        assert not kwargs.get('shell'), "VCS command run through a shell"
+        calls.append(args)
+        return 0
+
+    def system(command):
+        raise AssertionError(
+            "os.system(%r): VCS commands must never reach a shell" % (command,)
+        )
+
+    with mock.patch("subprocess.check_call", check_call):
+        with mock.patch("os.system", system):
+            yield calls
 
 
 class TestPackageIndex:
@@ -177,6 +206,227 @@ class TestPackageIndex:
         url, rev = vsrfu('https://example.com/bar@2995')
         assert url == 'https://example.com/bar'
         assert rev == '2995'
+
+    def test_download_git_with_rev(self, tmpdir):
+        url = 'git+https://github.example/group/project@master#egg=foo'
+        index = setuptools.package_index.PackageIndex()
+
+        with _no_shell() as calls:
+            result = index.download(url, str(tmpdir))
+
+        expected_dir = os.path.join(str(tmpdir), 'project@master')
+        assert calls == [
+            [
+                'git', 'clone', '--quiet',
+                'https://github.example/group/project', expected_dir,
+            ],
+            ['git', '-C', expected_dir, 'checkout', '--quiet', 'master'],
+        ]
+        assert result == expected_dir
+
+    def test_download_git_no_rev(self, tmpdir):
+        url = 'git+https://github.example/group/project#egg=foo'
+        index = setuptools.package_index.PackageIndex()
+
+        with _no_shell() as calls:
+            result = index.download(url, str(tmpdir))
+
+        expected_dir = os.path.join(str(tmpdir), 'project')
+        assert calls == [
+            [
+                'git', 'clone', '--quiet',
+                'https://github.example/group/project', expected_dir,
+            ],
+        ]
+        assert result == expected_dir
+
+    def test_download_hg_with_rev(self, tmpdir):
+        url = 'hg+https://hg.example/project@default#egg=foo'
+        index = setuptools.package_index.PackageIndex()
+
+        with _no_shell() as calls:
+            result = index.download(url, str(tmpdir))
+
+        expected_dir = os.path.join(str(tmpdir), 'project@default')
+        assert calls == [
+            [
+                'hg', 'clone', '--quiet',
+                'https://hg.example/project', expected_dir,
+            ],
+            ['hg', '--cwd', expected_dir, 'up', '-C', '-r', 'default', '-q'],
+        ]
+        assert result == expected_dir
+
+    def test_download_svn(self, tmpdir):
+        url = 'svn+https://svn.example/project#egg=foo'
+        index = setuptools.package_index.PackageIndex()
+
+        with _no_shell() as calls:
+            result = index.download(url, str(tmpdir))
+
+        expected_dir = os.path.join(str(tmpdir), 'project')
+        assert calls == [
+            [
+                'svn', 'checkout', '-q',
+                'svn+https://svn.example/project', expected_dir,
+            ],
+        ]
+        assert result == expected_dir
+
+    def test_download_svn_with_credentials(self, tmpdir):
+        url = 'svn:////user:secret@svn.example/project#egg=foo'
+        index = setuptools.package_index.PackageIndex()
+
+        with _no_shell() as calls:
+            result = index.download(url, str(tmpdir))
+
+        expected_dir = os.path.join(str(tmpdir), 'project')
+        assert len(calls) == 1
+        args = calls[0]
+        assert args[:4] == [
+            'svn', 'checkout', '--username=user', '--password=secret',
+        ]
+        assert args[4] == '-q'
+        assert args[-1] == expected_dir
+        assert result == expected_dir
+
+    # CVE-2024-6345: a VCS URL must never be interpolated into a shell
+    # command line.  Each case below is a URL whose path, revision or
+    # credentials carry shell metacharacters; the download must run the VCS
+    # tool through an argument vector, leaving the payload inert inside a
+    # single argv element.
+    @pytest.mark.parametrize(
+        'name,url,payload',
+        [
+            (
+                'project;$(touch pwned)',
+                'git+https://github.example/group/'
+                'project;$(touch pwned)#egg=foo',
+                'https://github.example/group/project;$(touch pwned)',
+            ),
+            (
+                'project@master;touch pwned',
+                'git+https://github.example/group/'
+                'project@master;touch pwned#egg=foo',
+                'master;touch pwned',
+            ),
+            (
+                'project;$(touch pwned)',
+                'hg+https://hg.example/project;$(touch pwned)#egg=foo',
+                'https://hg.example/project;$(touch pwned)',
+            ),
+            (
+                'project@default;touch pwned',
+                'hg+https://hg.example/project@default;touch pwned#egg=foo',
+                'default;touch pwned',
+            ),
+            (
+                'project;$(touch pwned)',
+                'svn+https://svn.example/project;$(touch pwned)#egg=foo',
+                'svn+https://svn.example/project;$(touch pwned)',
+            ),
+            (
+                'project;`touch pwned`',
+                'svn://user:pw@svn.example/project;`touch pwned`#egg=foo',
+                'svn://user:pw@svn.example/project;`touch pwned`',
+            ),
+            # the svn credentials are a separate interpolation site
+            (
+                'project',
+                'svn:////user:pw;touch pwned@svn.example/project#egg=foo',
+                '--password=pw;touch pwned',
+            ),
+        ],
+    )
+    def test_download_vcs_no_command_injection(
+            self, tmpdir, name, url, payload):
+        index = setuptools.package_index.PackageIndex()
+
+        with _no_shell() as calls:
+            result = index.download(url, str(tmpdir))
+
+        # the checkout lands where it was asked to, and nothing was run
+        # through a shell (``_no_shell`` fails the test on ``os.system`` /
+        # ``shell=True``)
+        assert result == os.path.join(str(tmpdir), name)
+        assert calls, "expected the VCS tool to be invoked"
+        for args in calls:
+            # an argument vector, so argv[0] is the program and every
+            # metacharacter in the remaining entries stays inert
+            assert isinstance(args, list)
+            assert args[0] in ('git', 'hg', 'svn')
+        # the payload does reach the command, as a single standalone argument
+        assert any(payload in args for args in calls)
+
+    # CVE-2024-6345, end to end: run the real download code against stand-in
+    # ``git``/``hg``/``svn`` executables placed first on PATH, and check that
+    # the shell payload carried in the URL is never executed.  On a
+    # vulnerable implementation the command line goes through ``/bin/sh``,
+    # which runs ``touch pwned`` in the working directory.
+    @pytest.mark.skipif(
+        os.name != 'posix',
+        reason="stand-in VCS executables are POSIX shell scripts",
+    )
+    @pytest.mark.parametrize(
+        'url,payload',
+        [
+            (
+                'git+https://github.example/group/project$(touch pwned)'
+                '#egg=foo',
+                'https://github.example/group/project$(touch pwned)',
+            ),
+            (
+                'git+https://github.example/group/project@master;touch pwned'
+                '#egg=foo',
+                'master;touch pwned',
+            ),
+            (
+                'hg+https://hg.example/project@default`touch pwned`#egg=foo',
+                'default`touch pwned`',
+            ),
+            (
+                'svn+https://svn.example/project;touch pwned#egg=foo',
+                'svn+https://svn.example/project;touch pwned',
+            ),
+            (
+                'svn:////user:pw;touch pwned;@svn.example/project#egg=foo',
+                '--password=pw;touch pwned;',
+            ),
+        ],
+    )
+    def test_download_vcs_payload_not_executed(
+            self, tmpdir, monkeypatch, url, payload):
+        bindir = tmpdir.join('bin')
+        bindir.ensure(dir=True)
+        for tool in ('git', 'hg', 'svn'):
+            script = bindir.join(tool)
+            script.write(
+                '#!/bin/sh\n'
+                'printf "%s\\n" "$@" >> "$FAKE_VCS_LOG"\n'
+            )
+            script.chmod(0o755)
+        log_file = tmpdir.join('vcs-args.log')
+        monkeypatch.setenv('FAKE_VCS_LOG', str(log_file))
+        monkeypatch.setenv(
+            'PATH', str(bindir) + os.pathsep + os.environ.get('PATH', ''))
+
+        workdir = tmpdir.join('work')
+        workdir.ensure(dir=True)
+        monkeypatch.chdir(str(workdir))
+        target = tmpdir.join('target')
+        target.ensure(dir=True)
+
+        index = setuptools.package_index.PackageIndex()
+        index.download(url, str(target))
+
+        # no shell ever interpreted the payload ...
+        assert not workdir.join('pwned').check()
+        assert not tmpdir.join('pwned').check()
+        assert not target.join('pwned').check()
+        # ... yet the stand-in VCS tool ran and got it verbatim, as one
+        # argument
+        assert log_file.check(file=1)
+        assert payload in log_file.read().splitlines()
 
     def test_local_index(self, tmpdir):
         """
